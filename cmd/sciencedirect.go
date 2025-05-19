@@ -30,7 +30,7 @@ var listCmd = &cobra.Command{
 	Short: "search list page",
 	Run: func(cmd *cobra.Command, args []string) {
 		logger := log.DefaultLogger
-		chrome, cacnel, err := pkg.NewChromePool(logger)
+		chrome, cacnel, err := pkg.NewChromePool(logger, ws)
 		if err != nil {
 			panic(err)
 		}
