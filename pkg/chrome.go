@@ -46,7 +46,7 @@ func NewChromePool(logger log.Logger, ws bool) (*ChromePool, func(), error) {
 
 	llog.Infof("Use chrome url: %s", launcherURL)
 
-	browser := rod.New().ControlURL(launcherURL).Timeout(30 * time.Second)
+	browser := rod.New().ControlURL(launcherURL)
 	err = browser.Connect()
 	if err != nil {
 		return nil, nil, err

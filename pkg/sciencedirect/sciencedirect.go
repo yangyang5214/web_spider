@@ -1,7 +1,7 @@
 package sciencedirect
 
 import (
-	"github.com/go-kratos/kratos/v2/errors"
+	"context"
 	"github.com/go-kratos/kratos/v2/log"
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
@@ -10,6 +10,8 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
+	"time"
 	"web_spider/pkg"
 )
 
@@ -19,21 +21,83 @@ type ScienceDirect struct {
 	chrome  *pkg.ChromePool
 	workDir string
 	page    *rod.Page
+
+	ctx        context.Context
+	cancel     context.CancelFunc
+	maxWorkers int
+	wg         sync.WaitGroup
+	saveChan   chan saveTask
+	domain     string
 }
 
-func NewScienceDirect(chrome *pkg.ChromePool, logger log.Logger) *ScienceDirect {
-	homeDir, _ := os.UserHomeDir()
+type saveTask struct {
+	targetUrl string
+	reqId     proto.NetworkRequestID
+}
 
-	return &ScienceDirect{
-		log:     log.NewHelper(logger),
-		chrome:  chrome,
-		workDir: path.Join(homeDir, "sciencedirect"),
+func NewScienceDirect(chrome *pkg.ChromePool, logger log.Logger) (*ScienceDirect, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, ctxCancel := context.WithCancel(context.Background())
+
+	workDir := path.Join(homeDir, "sciencedirect")
+	err = os.MkdirAll(workDir, 0755)
+	if err != nil {
+		ctxCancel()
+		return nil, err
+	}
+
+	sd := &ScienceDirect{
+		cancel:     ctxCancel,
+		ctx:        ctx,
+		log:        log.NewHelper(logger),
+		chrome:     chrome,
+		maxWorkers: 5,
+		workDir:    workDir,
+		saveChan:   make(chan saveTask),
+		domain:     "https://www.sciencedirect.com/",
+	}
+
+	for i := 0; i < sd.maxWorkers; i++ {
+		sd.wg.Add(1)
+		go sd.saveWorker()
+	}
+
+	return sd, nil
+}
+
+func (s *ScienceDirect) Close() error {
+	s.log.Infof("Closing ScienceDirect")
+	s.cancel()
+
+	s.log.Infof("start wait for all workers to finish")
+	s.wg.Wait()
+	s.log.Infof("all workers finished")
+
+	return nil
+}
+
+func (s *ScienceDirect) saveWorker() {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case task := <-s.saveChan:
+			if err := s.saveDir(task.targetUrl, task.reqId); err != nil {
+				s.log.Errorf("Failed to save response: %v", err)
+			}
+		case <-s.ctx.Done():
+			return
+		}
 	}
 }
 
 func (s *ScienceDirect) List() error {
 	page, err := s.chrome.Browser.Page(proto.TargetCreateTarget{
-		URL: "https://www.sciencedirect.com/",
+		URL: s.domain,
 	})
 
 	if err != nil {
@@ -42,18 +106,33 @@ func (s *ScienceDirect) List() error {
 	s.page = page
 
 	go page.EachEvent(func(e *proto.NetworkResponseReceived) {
-		//save to dir
 		respUrl := e.Response.URL
+
+		if strings.HasPrefix(respUrl, s.domain) {
+			s.log.Debugf("new resp url: %v", respUrl)
+		}
+
 		if strings.HasPrefix(respUrl, "https://www.sciencedirect.com/search/api") {
 			s.log.Infof("sciencedirect api url: %s", respUrl)
-			go s.saveDir(respUrl, e.RequestID)
+
+			select {
+			case s.saveChan <- saveTask{targetUrl: respUrl, reqId: e.RequestID}:
+			case <-s.ctx.Done():
+				s.log.Infof("context done, stop saving")
+				return
+			}
 		}
 	})()
 
-	select {}
+	<-s.ctx.Done()
+	return nil
 }
 
 func (s *ScienceDirect) saveDir(targetUrl string, reqId proto.NetworkRequestID) (err error) {
+	s.log.Infof("start new task for target url: %s", targetUrl)
+
+	time.Sleep(5 * time.Second)
+
 	m := proto.NetworkGetResponseBody{RequestID: reqId}
 	resp, err := m.Call(s.page)
 	if err != nil {
@@ -77,9 +156,8 @@ func (s *ScienceDirect) saveDir(targetUrl string, reqId proto.NetworkRequestID) 
 		pii := sr.Get("pii").String()
 		resultPath := path.Join(qsDir, pii+".json")
 
-		_, err = os.Stat(resultPath)
-		if errors.Is(err, os.ErrNotExist) {
-			continue // skip if file exists
+		if pkg.FileExists(resultPath) {
+			continue
 		}
 
 		err = os.WriteFile(resultPath, []byte(sr.String()), 0755)
@@ -92,5 +170,60 @@ func (s *ScienceDirect) saveDir(targetUrl string, reqId proto.NetworkRequestID) 
 }
 
 func (s *ScienceDirect) Detail() error {
+	entries, err := os.ReadDir(s.workDir)
+	if err != nil {
+		s.log.Errorf("ReadDir err: %+v", err)
+		return err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		urls, err := s.parseAllLink(path.Join(s.workDir, entry.Name()))
+
+		s.log.Infof("for keyword: %s, size: %d", entry.Name(), len(urls))
+
+		if err != nil {
+			s.log.Errorf("process err: %+v", err)
+			return err
+		}
+
+		for _, urlItem := range urls {
+			err = s.process(urlItem)
+			if err != nil {
+				s.log.Errorf("process err: %+v", err)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *ScienceDirect) parseAllLink(workDir string) ([]string, error) {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		s.log.Errorf("ReadDir err: %+v", err)
+		return nil, err
+	}
+
+	var results []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".json") {
+			abstractFile := strings.ReplaceAll(entry.Name(), ".json", ".abstract")
+			if pkg.FileExists(abstractFile) {
+				continue
+			}
+			results = append(results, path.Join(workDir, entry.Name()))
+		}
+	}
+	return results, nil
+}
+
+func (s *ScienceDirect) process(path string) error {
 	return nil
 }
