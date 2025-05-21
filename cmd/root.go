@@ -26,10 +26,12 @@ func Execute() {
 var (
 	inputFile string
 	ws        bool
+	inputDir  string
 )
 
 func init() {
 	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 	rootCmd.PersistentFlags().StringVarP(&inputFile, "input", "i", "", "Input file path")
+	rootCmd.PersistentFlags().StringVarP(&inputDir, "input_dir", "d", "", "Input dir path")
 	rootCmd.PersistentFlags().BoolVarP(&ws, "ws", "", false, "use websocket")
 }

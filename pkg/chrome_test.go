@@ -19,3 +19,7 @@ func TestName(t *testing.T) {
 
 	time.Sleep(10 * time.Second)
 }
+
+func TestNanosecond(t *testing.T) {
+	t.Log(time.Now().Unix() % 10)
+}

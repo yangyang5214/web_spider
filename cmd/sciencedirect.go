@@ -52,7 +52,7 @@ var listCmd = &cobra.Command{
 
 		go func() {
 			<-sigChan
-			sd.Close() // 收到终止信号时关闭
+			_ = sd.Close() // 收到终止信号时关闭
 			os.Exit(0)
 		}()
 
@@ -68,11 +68,20 @@ var detailCmd = &cobra.Command{
 	Use:   "detail",
 	Short: "single page",
 	Run: func(cmd *cobra.Command, args []string) {
-		sd, err := sciencedirect.NewScienceDirect(nil, log.DefaultLogger)
+		logger := log.DefaultLogger
+		chrome, chromeCancel, err := pkg.NewChromePool(logger, ws)
 		if err != nil {
 			panic(err)
 		}
-		err = sd.Detail()
+		if !ws {
+			chromeCancel()
+		}
+
+		sd, err := sciencedirect.NewScienceDirect(chrome, logger)
+		if err != nil {
+			panic(err)
+		}
+		err = sd.Detail(inputDir)
 		if err != nil {
 			panic(err)
 		}

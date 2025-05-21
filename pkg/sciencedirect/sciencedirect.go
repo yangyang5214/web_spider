@@ -2,10 +2,12 @@ package sciencedirect
 
 import (
 	"context"
+	"github.com/antchfx/htmlquery"
 	"github.com/go-kratos/kratos/v2/log"
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/tidwall/gjson"
+	"golang.org/x/net/html"
 	"net/url"
 	"os"
 	"path"
@@ -58,7 +60,7 @@ func NewScienceDirect(chrome *pkg.ChromePool, logger log.Logger) (*ScienceDirect
 		maxWorkers: 5,
 		workDir:    workDir,
 		saveChan:   make(chan saveTask),
-		domain:     "https://www.sciencedirect.com/",
+		domain:     "https://www.sciencedirect.com",
 	}
 
 	for i := 0; i < sd.maxWorkers; i++ {
@@ -131,7 +133,7 @@ func (s *ScienceDirect) List() error {
 func (s *ScienceDirect) saveDir(targetUrl string, reqId proto.NetworkRequestID) (err error) {
 	s.log.Infof("start new task for target url: %s", targetUrl)
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(5 * time.Second) // wait for response
 
 	m := proto.NetworkGetResponseBody{RequestID: reqId}
 	resp, err := m.Call(s.page)
@@ -169,33 +171,33 @@ func (s *ScienceDirect) saveDir(targetUrl string, reqId proto.NetworkRequestID) 
 	return
 }
 
-func (s *ScienceDirect) Detail() error {
-	entries, err := os.ReadDir(s.workDir)
+func (s *ScienceDirect) Detail(workDir string) error {
+	if workDir == "" {
+		s.log.Infof("workDir is empty")
+		return nil
+	}
+	page, err := s.chrome.Browser.Page(proto.TargetCreateTarget{
+		URL: s.domain,
+	})
+
 	if err != nil {
-		s.log.Errorf("ReadDir err: %+v", err)
+		return err
+	}
+	s.page = page
+
+	urls, err := s.parseAllLink(workDir)
+	s.log.Infof("for dir: %s, size: %d", workDir, len(urls))
+
+	if err != nil {
+		s.log.Errorf("process err: %+v", err)
 		return err
 	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		urls, err := s.parseAllLink(path.Join(s.workDir, entry.Name()))
-
-		s.log.Infof("for keyword: %s, size: %d", entry.Name(), len(urls))
-
+	for _, urlItem := range urls {
+		err = s.process(urlItem)
 		if err != nil {
 			s.log.Errorf("process err: %+v", err)
 			return err
-		}
-
-		for _, urlItem := range urls {
-			err = s.process(urlItem)
-			if err != nil {
-				s.log.Errorf("process err: %+v", err)
-				return err
-			}
 		}
 	}
 	return nil
@@ -225,5 +227,68 @@ func (s *ScienceDirect) parseAllLink(workDir string) ([]string, error) {
 }
 
 func (s *ScienceDirect) process(path string) error {
-	return nil
+	byteData, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	jsonResult := gjson.Parse(string(byteData))
+	link := jsonResult.Get("link").String()
+
+	targetLink := s.domain + link
+	s.log.Infof("Do process link: %s", targetLink)
+
+	err = s.page.Navigate(targetLink)
+	if err != nil {
+		s.log.Errorf("page.Navigate err: %+v", err)
+		return err
+	}
+
+	second := time.Duration(time.Now().Unix()%10 + 10)
+	time.Sleep(second * time.Second)
+
+	htmlContent, err := s.page.HTML()
+	if err != nil {
+		return err
+	}
+	doc, err := htmlquery.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		return err
+	}
+
+	content, err := parseText(doc)
+	if err != nil {
+		return err
+	}
+
+	content = strings.TrimLeft(content, "Abstract")
+
+	abstractFile := strings.ReplaceAll(path, ".json", ".abstract")
+
+	return os.WriteFile(abstractFile, []byte(content), 0755)
+}
+
+func parseText(doc *html.Node) (string, error) {
+
+	xpaths := []string{
+		"//div[@id='abstracts']//text()",
+		"//div[@id='body']//text()"}
+
+	for _, xpath := range xpaths {
+		contentNode, err := htmlquery.QueryAll(doc, xpath)
+		if err != nil {
+			continue
+		}
+		if len(contentNode) == 0 {
+			continue
+		}
+
+		var article strings.Builder
+		for _, node := range contentNode {
+			item := htmlquery.InnerText(node)
+			article.WriteString(item)
+		}
+		return article.String(), nil
+	}
+	return "", nil
 }
